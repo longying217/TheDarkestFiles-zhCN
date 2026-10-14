@@ -2,7 +2,7 @@
 
 为 Steam 版 [The Darkest Files](https://store.steampowered.com/app/2058730/The_Darkest_Files/)（中文暂译《至暗卷宗》）制作的玩家自制简体中文补丁。
 
-**[⬇ 下载 v1.0.3（Windows / Steam Deck）](https://github.com/longying217/TheDarkestFiles-zhCN/raw/main/download/TDF_zhCN_v1.0.3.zip)**
+**[⬇ 下载最新版本（Windows / Steam Deck）](https://github.com/longying217/TheDarkestFiles-zhCN/releases/latest)**
 
 | | |
 |---|---|
@@ -21,7 +21,7 @@
 
 ## 安装
 
-1. 下载 [TDF_zhCN_v1.0.3.zip](https://github.com/longying217/TheDarkestFiles-zhCN/raw/main/download/TDF_zhCN_v1.0.3.zip)。
+1. 从 [Releases](https://github.com/longying217/TheDarkestFiles-zhCN/releases/latest) 页面的 Assets 下载 `TDF_zhCN_v*.zip`。
 2. Steam 库中右键游戏 → 管理 → 浏览本地文件，打开游戏目录。
 3. 把压缩包里的全部内容解压到游戏目录，与 `The Darkest Files.exe` 放在同一层。
 4. **仅 Steam Deck**：游戏属性 → 启动选项，填入
