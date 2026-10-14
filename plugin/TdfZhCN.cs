@@ -30,7 +30,7 @@ namespace TdfZhCN
     public class Plugin : BaseUnityPlugin
     {
         public const string Guid = "long.tdf.zhcn";
-        public const string Version = "1.0.3";
+        public const string Version = "1.0.4";
 
         internal static ManualLogSource Log;
         internal static string Dir;
@@ -76,6 +76,7 @@ namespace TdfZhCN
             TryPatch("Font redirect", () => FontManager.ApplyPatches(harmony));
             TryPatch("DialogueManager.SetLanguage", () => DialoguePatcher.ApplyPatches(harmony));
             TryPatch("Character names", () => NamePatch.Apply(harmony));
+            TryPatch("Archive index cards", () => ArchiveCardPatch.Apply(harmony));
 
             // The game destroys BepInEx's manager object, so this component's Update() never runs.
             // Drive the periodic work from sources that survive: a hidden runner object,
@@ -301,6 +302,81 @@ namespace TdfZhCN
     // =====================================================================
     // Character names (dialogue log, notebook): CharacterData.FullName etc.
     // =====================================================================
+    // =====================================================================
+    // Archive file cabinet / index cards: names are stored on ArchiveIndexCard assets,
+    // not in string tables. Only the display is changed; the getters stay English because
+    // the cabinet drawers filter cards by the first letter of the last name.
+    // =====================================================================
+    static class ArchiveCardPatch
+    {
+        static MethodInfo getFirst, getLast, fmt2;
+
+        public static void Apply(Harmony h)
+        {
+            var card = AccessTools.TypeByName("TDF.Plugins.PaintbucketArticyConverter.Archives.ArchiveIndexCard");
+            getFirst = AccessTools.PropertyGetter(card, "FirstName");
+            getLast = AccessTools.PropertyGetter(card, "LastName");
+            fmt2 = AccessTools.Method(typeof(string), "Format", new[] { typeof(string), typeof(object), typeof(object) });
+            var targets = new List<MethodBase>();
+            var doc = AccessTools.TypeByName("TDF.DocumentMode.Pages.IndexCardDocumentObject");
+            targets.Add(AccessTools.Method(doc, "Initialize"));
+            var folder = AccessTools.TypeByName("TDF.GUI.Archives.FileCabinetFolder");
+            foreach (var nt in folder.GetNestedTypes(BindingFlags.NonPublic | BindingFlags.Public))
+                foreach (var m in nt.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                    if (m.Name.Contains("InitData") && m.GetMethodBody() != null) targets.Add(m);
+            int n = 0;
+            foreach (var m in targets)
+            {
+                if (m == null) continue;
+                h.Patch(m, transpiler: new HarmonyMethod(typeof(ArchiveCardPatch), nameof(Transpiler)));
+                n++;
+            }
+            Plugin.Log.LogInfo($"[TDF-zh] archive card display patched in {n} methods");
+        }
+
+        static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> ins)
+        {
+            foreach (var i in ins)
+            {
+                var mi = i.operand as MethodInfo;
+                if (mi != null && (i.opcode == OpCodes.Call || i.opcode == OpCodes.Callvirt))
+                {
+                    if (mi == getFirst || mi == getLast)
+                    {
+                        yield return new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(ArchiveCardPatch), mi == getFirst ? nameof(First) : nameof(Last))) { labels = i.labels, blocks = i.blocks };
+                        continue;
+                    }
+                    if (mi == fmt2)
+                    {
+                        yield return new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(ArchiveCardPatch), nameof(Format))) { labels = i.labels, blocks = i.blocks };
+                        continue;
+                    }
+                }
+                yield return i;
+            }
+        }
+
+        static bool Active()
+        {
+            try { return Plugin.IsTarget(LocalizationSettings.SelectedLocale); } catch { return false; }
+        }
+
+        static string Zh(string en)
+        {
+            string z;
+            return (en != null && Active() && Plugin.Names.TryGetValue(en, out z)) ? z : en;
+        }
+
+        public static string First(object card) => Zh((string)getFirst.Invoke(card, null));
+        public static string Last(object card) => Zh((string)getLast.Invoke(card, null));
+
+        public static string Format(string format, object a, object b)
+        {
+            if (Active() && format != null && format.Replace(" ", "") == "{0},{1}") return a + "，" + b;
+            return string.Format(format, a, b);
+        }
+    }
+
     static class NamePatch
     {
         public static void Apply(Harmony h)
