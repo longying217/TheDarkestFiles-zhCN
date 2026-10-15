@@ -30,7 +30,7 @@ namespace TdfZhCN
     public class Plugin : BaseUnityPlugin
     {
         public const string Guid = "long.tdf.zhcn";
-        public const string Version = "1.0.4";
+        public const string Version = "1.0.5";
 
         internal static ManualLogSource Log;
         internal static string Dir;
@@ -42,6 +42,8 @@ namespace TdfZhCN
         internal static readonly Dictionary<string, string> DlgText = new Dictionary<string, string>();
         internal static readonly Dictionary<string, string> MenuText = new Dictionary<string, string>();
         internal static readonly Dictionary<string, string> Names = new Dictionary<string, string>(); // English name -> Chinese
+        internal static readonly HashSet<string> Smart = new HashSet<string>();                          // "Table/KeyId" entries that use Smart Format
+        internal static readonly Dictionary<string, string> Hardcoded = new Dictionary<string, string>(); // exact UI text baked into prefabs
 
         internal static ConfigEntry<bool> CfgEnglishImages;
         internal static ConfigEntry<bool> CfgLogMissing;
@@ -112,6 +114,7 @@ namespace TdfZhCN
             try { FontManager.Ensure(); } catch (Exception e) { Log.LogError("[TDF-zh] font: " + e); FontManager.Failed = true; }
             try { DialoguePatcher.Scan(); } catch (Exception e) { Log.LogError("[TDF-zh] dialogue: " + e); }
             try { TablePatches.BulkApply(); } catch (Exception e) { Log.LogError("[TDF-zh] tables: " + e); }
+            try { HardcodedText.Scan(); } catch (Exception e) { Log.LogError("[TDF-zh] labels: " + e); }
         }
 
         // ---------------- translation file ----------------
@@ -142,6 +145,8 @@ namespace TdfZhCN
                         else if (p[0] == "D" && p.Length >= 3) { DlgText[p[1]] = Unescape(p[2]); n++; }
                         else if (p[0] == "M" && p.Length >= 3) { MenuText[p[1]] = Unescape(p[2]); n++; }
                         else if (p[0] == "N" && p.Length >= 3) { Names[Unescape(p[1])] = Unescape(p[2]); n++; }
+                        else if (p[0] == "S" && p.Length >= 3) { Smart.Add(p[1] + "/" + p[2]); n++; }
+                        else if (p[0] == "H" && p.Length >= 3) { Hardcoded[Unescape(p[1])] = Unescape(p[2]); n++; }
                     }
                     catch (Exception e) { Log.LogWarning($"[TDF-zh] {Path.GetFileName(f)}:{lineNo} bad line: {e.Message}"); }
                 }
@@ -205,6 +210,8 @@ namespace TdfZhCN
             if (Plugin.Tables.TryGetValue(name, out d) && d.TryGetValue(e.KeyId, out z))
             {
                 if (!string.Equals(e.Value, z, StringComparison.Ordinal)) e.Value = z;
+                // some French entries lost the Smart Format flag ({action} etc. stayed literal)
+                if (!e.IsSmart && Plugin.Smart.Contains(name + "/" + e.KeyId)) e.IsSmart = true;
             }
             else if (fromDisplay && Plugin.CfgLogMissing.Value)
             {
@@ -234,8 +241,18 @@ namespace TdfZhCN
                 var table = h.Result;
                 if (table == null) continue;
                 if (!bulkDone.Add(table.GetInstanceID())) continue;
-                int n = 0;
+                int n = 0, added = 0;
+                // ~490 entries exist in English but not in the game's French tables
+                // ("No translation found for ..."); add them so the Chinese text has a home.
+                Dictionary<long, string> d;
+                if (Plugin.Tables.TryGetValue(name, out d))
+                    foreach (var kv in d)
+                        if (table.GetEntry(kv.Key) == null)
+                        {
+                            try { table.AddEntry(kv.Key, kv.Value); added++; } catch { }
+                        }
                 foreach (var e in table.Values) { ApplyEntry(e, false); n++; }
+                if (added > 0) Plugin.Log.LogInfo($"[TDF-zh] table {name}: added {added} entries missing from the French table");
                 Plugin.Log.LogInfo($"[TDF-zh] table {name}: applied ({n} entries)");
             }
         }
@@ -374,6 +391,47 @@ namespace TdfZhCN
         {
             if (Active() && format != null && format.Replace(" ", "") == "{0},{1}") return a + "，" + b;
             return string.Format(format, a, b);
+        }
+    }
+
+    // =====================================================================
+    // Text baked into prefabs (never localized by the game, e.g. full names on
+    // comic panels, the "Statements" header). Exact whole-text matches only.
+    // =====================================================================
+    static class HardcodedText
+    {
+        // instance id -> (original English, the Chinese we put there)
+        static readonly Dictionary<int, KeyValuePair<string, string>> swapped = new Dictionary<int, KeyValuePair<string, string>>();
+
+        public static void Scan()
+        {
+            bool zh = Plugin.IsTarget(LocalizationSettings.SelectedLocale);
+            foreach (var t in Resources.FindObjectsOfTypeAll<TMP_Text>())
+            {
+                if (t == null) continue;
+                var cur = t.text;
+                if (string.IsNullOrEmpty(cur)) continue;
+                int id = t.GetInstanceID();
+                KeyValuePair<string, string> sw;
+                bool had = swapped.TryGetValue(id, out sw);
+                if (had && !string.Equals(cur, sw.Value, StringComparison.Ordinal)) { swapped.Remove(id); had = false; } // game changed it since
+                if (zh)
+                {
+                    if (had) continue;
+                    var key = cur.Trim();
+                    string z;
+                    if ((key.IndexOf(' ') > 0 && Plugin.Names.TryGetValue(key, out z)) || Plugin.Hardcoded.TryGetValue(key, out z))
+                    {
+                        swapped[id] = new KeyValuePair<string, string>(cur, z);
+                        t.text = z;
+                    }
+                }
+                else if (had)
+                {
+                    t.text = sw.Key;
+                    swapped.Remove(id);
+                }
+            }
         }
     }
 
