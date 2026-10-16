@@ -30,7 +30,7 @@ namespace TdfZhCN
     public class Plugin : BaseUnityPlugin
     {
         public const string Guid = "long.tdf.zhcn";
-        public const string Version = "1.0.5";
+        public const string Version = "1.0.7";
 
         internal static ManualLogSource Log;
         internal static string Dir;
@@ -42,7 +42,8 @@ namespace TdfZhCN
         internal static readonly Dictionary<string, string> DlgText = new Dictionary<string, string>();
         internal static readonly Dictionary<string, string> MenuText = new Dictionary<string, string>();
         internal static readonly Dictionary<string, string> Names = new Dictionary<string, string>(); // English name -> Chinese
-        internal static readonly HashSet<string> Smart = new HashSet<string>();                          // "Table/KeyId" entries that use Smart Format
+        internal static readonly Dictionary<string, HashSet<long>> Smart = new Dictionary<string, HashSet<long>>(); // table -> KeyIds that use Smart Format
+        internal static string PrewarmChars = "";  // every CJK character used by the translation
         internal static readonly Dictionary<string, string> Hardcoded = new Dictionary<string, string>(); // exact UI text baked into prefabs
 
         internal static ConfigEntry<bool> CfgEnglishImages;
@@ -53,7 +54,12 @@ namespace TdfZhCN
 
         Harmony harmony;
         static float nextScan;
+        // one-shot work requested by events (scene load, language change); nothing runs on a timer during play
+        internal static bool FontScanPending = true, DialogueScanPending = true, TableScanPending = true;
         static string tickSource;
+        static int lastFrame = -1;
+        static bool localeHooked;
+        internal static volatile bool ZhActive;   // cached: is the Chinese (fr) slot selected
 
         void Awake()
         {
@@ -79,11 +85,16 @@ namespace TdfZhCN
             TryPatch("DialogueManager.SetLanguage", () => DialoguePatcher.ApplyPatches(harmony));
             TryPatch("Character names", () => NamePatch.Apply(harmony));
             TryPatch("Archive index cards", () => ArchiveCardPatch.Apply(harmony));
+            TryPatch("Prefab labels", () => HardcodedText.Apply(harmony));
 
             // The game destroys BepInEx's manager object, so this component's Update() never runs.
             // Drive the periodic work from sources that survive: a hidden runner object,
             // a per-frame static engine event, and scene loads.
-            SceneManager.sceneLoaded += (s, m) => { nextScan = 0; Tick("sceneLoaded"); };
+            SceneManager.sceneLoaded += (s, m) =>
+            {
+                FontScanPending = DialogueScanPending = TableScanPending = HardcodedText.RescanPending = true;
+                nextScan = 0; Tick("sceneLoaded");
+            };
             Application.onBeforeRender += () => Tick("onBeforeRender");
             try
             {
@@ -106,15 +117,53 @@ namespace TdfZhCN
 
         void Update() { Tick("plugin.Update"); }
 
+        // Called several times per frame (runner, onBeforeRender, scene loads).
+        // v1.0.7: during play the plugin does no periodic scanning at all.
+        //  - every frame, right after Chinese is selected: pre-render CJK glyphs in small batches,
+        //    then freeze the atlas (static + non-readable)
+        //  - every 2 s: only the startup retries (font/tables/dialogue not ready yet) and one cheap list check
+        //  - on scene load / language change / new dialogue database: one full pass
         internal static void Tick(string source)
         {
+            int frame = Time.frameCount;
+            if (frame != lastFrame)
+            {
+                lastFrame = frame;
+                if (ZhActive && !FontManager.Frozen)
+                {
+                    try { FontManager.PrewarmStep(); }
+                    catch (Exception e) { Log.LogError("[TDF-zh] prewarm: " + e); FontManager.Frozen = true; }
+                }
+            }
             if (Time.unscaledTime < nextScan) return;
             nextScan = Time.unscaledTime + 2f;
             if (tickSource == null) { tickSource = source; Log.LogInfo("[TDF-zh] periodic work running (via " + source + ")"); }
-            try { FontManager.Ensure(); } catch (Exception e) { Log.LogError("[TDF-zh] font: " + e); FontManager.Failed = true; }
-            try { DialoguePatcher.Scan(); } catch (Exception e) { Log.LogError("[TDF-zh] dialogue: " + e); }
-            try { TablePatches.BulkApply(); } catch (Exception e) { Log.LogError("[TDF-zh] tables: " + e); }
-            try { HardcodedText.Scan(); } catch (Exception e) { Log.LogError("[TDF-zh] labels: " + e); }
+            if (!localeHooked) { try { HookLocale(); } catch (Exception e) { Log.LogError("[TDF-zh] locale: " + e); localeHooked = true; } }
+            try
+            {
+                if (FontManager.Cjk == null || FontScanPending) { FontScanPending = false; FontManager.Ensure(); }
+                else if (FontManager.EnsureGlobal()) FontScanPending = true;   // TMP settings were reset: redo the full pass next time
+            }
+            catch (Exception e) { Log.LogError("[TDF-zh] font: " + e); FontManager.Failed = true; }
+            DialoguePatcher.CheckMaster();
+            if (DialogueScanPending || !DialoguePatcher.Ready) { DialogueScanPending = false; try { DialoguePatcher.Scan(); } catch (Exception e) { Log.LogError("[TDF-zh] dialogue: " + e); } }
+            if (TableScanPending || !TablePatches.AllDone) { TableScanPending = false; try { TablePatches.BulkApply(); } catch (Exception e) { Log.LogError("[TDF-zh] tables: " + e); } }
+            if (HardcodedText.RescanPending) { HardcodedText.RescanPending = false; try { HardcodedText.ScanAll(); } catch (Exception e) { Log.LogError("[TDF-zh] labels: " + e); } }
+        }
+
+        static void HookLocale()
+        {
+            if (!LocalizationSettings.InitializationOperation.IsDone) return;
+            localeHooked = true;
+            LocalizationSettings.SelectedLocaleChanged += OnLocaleChanged;
+            OnLocaleChanged(LocalizationSettings.SelectedLocale);
+        }
+
+        static void OnLocaleChanged(Locale l)
+        {
+            ZhActive = IsTarget(l);
+            HardcodedText.RescanPending = TableScanPending = DialogueScanPending = true;
+            nextScan = 0;
         }
 
         // ---------------- translation file ----------------
@@ -145,13 +194,23 @@ namespace TdfZhCN
                         else if (p[0] == "D" && p.Length >= 3) { DlgText[p[1]] = Unescape(p[2]); n++; }
                         else if (p[0] == "M" && p.Length >= 3) { MenuText[p[1]] = Unescape(p[2]); n++; }
                         else if (p[0] == "N" && p.Length >= 3) { Names[Unescape(p[1])] = Unescape(p[2]); n++; }
-                        else if (p[0] == "S" && p.Length >= 3) { Smart.Add(p[1] + "/" + p[2]); n++; }
+                        else if (p[0] == "S" && p.Length >= 3)
+                        {
+                            HashSet<long> hs;
+                            if (!Smart.TryGetValue(p[1], out hs)) Smart[p[1]] = hs = new HashSet<long>();
+                            hs.Add(long.Parse(p[2])); n++;
+                        }
                         else if (p[0] == "H" && p.Length >= 3) { Hardcoded[Unescape(p[1])] = Unescape(p[2]); n++; }
                     }
                     catch (Exception e) { Log.LogWarning($"[TDF-zh] {Path.GetFileName(f)}:{lineNo} bad line: {e.Message}"); }
                 }
                 Log.LogInfo($"[TDF-zh] {Path.GetFileName(f)}: {n} entries");
             }
+            var cs = new HashSet<char>();
+            IEnumerable<string> vals = Tables.Values.SelectMany(d => d.Values).Concat(DlgText.Values).Concat(MenuText.Values)
+                .Concat(Names.Values).Concat(Hardcoded.Values);
+            foreach (var v in vals) foreach (var c in v) if (c >= 0x2E80 && !char.IsSurrogate(c)) cs.Add(c);
+            PrewarmChars = new string(cs.OrderBy(c => c).ToArray());
         }
 
         static string Unescape(string s)
@@ -187,6 +246,7 @@ namespace TdfZhCN
         static readonly HashSet<int> bulkDone = new HashSet<int>();
         static readonly Dictionary<string, AsyncOperationHandle<StringTable>> pending = new Dictionary<string, AsyncOperationHandle<StringTable>>();
         static string bulkLocale;
+        internal static bool AllDone;   // every table for the current locale has been loaded and processed
 
         public static void Apply(Harmony h)
         {
@@ -211,7 +271,8 @@ namespace TdfZhCN
             {
                 if (!string.Equals(e.Value, z, StringComparison.Ordinal)) e.Value = z;
                 // some French entries lost the Smart Format flag ({action} etc. stayed literal)
-                if (!e.IsSmart && Plugin.Smart.Contains(name + "/" + e.KeyId)) e.IsSmart = true;
+                HashSet<long> sm;
+                if (!e.IsSmart && Plugin.Smart.TryGetValue(name, out sm) && sm.Contains(e.KeyId)) e.IsSmart = true;
             }
             else if (fromDisplay && Plugin.CfgLogMissing.Value)
             {
@@ -224,10 +285,12 @@ namespace TdfZhCN
         // so code that reads entry.Value directly also gets Chinese.
         public static void BulkApply()
         {
+            AllDone = false;
             if (!LocalizationSettings.InitializationOperation.IsDone) return;
             var loc = LocalizationSettings.SelectedLocale;
-            if (!Plugin.IsTarget(loc)) { bulkLocale = null; return; }
+            if (!Plugin.IsTarget(loc)) { bulkLocale = null; AllDone = true; return; }
             if (bulkLocale != Plugin.Target) { bulkLocale = Plugin.Target; pending.Clear(); }
+            int finished = 0;
 
             foreach (var name in Plugin.Tables.Keys)
             {
@@ -237,7 +300,9 @@ namespace TdfZhCN
                     h = LocalizationSettings.StringDatabase.GetTableAsync(name, loc);
                     pending[name] = h;
                 }
-                if (!h.IsValid() || !h.IsDone) continue;
+                if (!h.IsValid()) { finished++; continue; }   // table does not exist for this locale
+                if (!h.IsDone) continue;
+                finished++;
                 var table = h.Result;
                 if (table == null) continue;
                 if (!bulkDone.Add(table.GetInstanceID())) continue;
@@ -255,6 +320,7 @@ namespace TdfZhCN
                 if (added > 0) Plugin.Log.LogInfo($"[TDF-zh] table {name}: added {added} entries missing from the French table");
                 Plugin.Log.LogInfo($"[TDF-zh] table {name}: applied ({n} entries)");
             }
+            AllDone = finished == Plugin.Tables.Count;
         }
     }
 
@@ -400,37 +466,84 @@ namespace TdfZhCN
     // =====================================================================
     static class HardcodedText
     {
-        // instance id -> (original English, the Chinese we put there)
-        static readonly Dictionary<int, KeyValuePair<string, string>> swapped = new Dictionary<int, KeyValuePair<string, string>>();
+        // text object -> (original English, the Chinese we put there)
+        static readonly Dictionary<TMP_Text, KeyValuePair<string, string>> swapped = new Dictionary<TMP_Text, KeyValuePair<string, string>>();
+        internal static bool RescanPending = true;
 
-        public static void Scan()
+        // Event-driven instead of polling: check a label when it is enabled or when the game sets its text.
+        public static void Apply(Harmony h)
         {
-            bool zh = Plugin.IsTarget(LocalizationSettings.SelectedLocale);
-            foreach (var t in Resources.FindObjectsOfTypeAll<TMP_Text>())
+            var post = new HarmonyMethod(typeof(HardcodedText), nameof(OnEnablePostfix));
+            h.Patch(AccessTools.Method(typeof(TextMeshProUGUI), "OnEnable"), postfix: post);
+            h.Patch(AccessTools.Method(typeof(TextMeshPro), "OnEnable"), postfix: post);
+            h.Patch(AccessTools.PropertySetter(typeof(TMP_Text), "text"), prefix: new HarmonyMethod(typeof(HardcodedText), nameof(SetPrefix)));
+            h.Patch(AccessTools.Method(typeof(TMP_Text), "SetText", new[] { typeof(string), typeof(bool) }), prefix: new HarmonyMethod(typeof(HardcodedText), nameof(SetTextPrefix)));
+            h.Patch(AccessTools.PropertySetter(typeof(TMP_Text), "font"), prefix: new HarmonyMethod(typeof(HardcodedText), nameof(SetFontPrefix)));
+        }
+
+        static void SetFontPrefix(TMP_FontAsset value) { try { FontManager.AttachTo(value); } catch { } }
+
+        static bool Lookup(string s, out string z)
+        {
+            z = null;
+            if (s == null || s.Length == 0 || s.Length > 80) return false;
+            var key = (char.IsWhiteSpace(s[0]) || char.IsWhiteSpace(s[s.Length - 1])) ? s.Trim() : s;
+            return (key.IndexOf(' ') > 0 && Plugin.Names.TryGetValue(key, out z)) || Plugin.Hardcoded.TryGetValue(key, out z);
+        }
+
+        static void OnEnablePostfix(TMP_Text __instance)
+        {
+            try
             {
-                if (t == null) continue;
-                var cur = t.text;
-                if (string.IsNullOrEmpty(cur)) continue;
-                int id = t.GetInstanceID();
-                KeyValuePair<string, string> sw;
-                bool had = swapped.TryGetValue(id, out sw);
-                if (had && !string.Equals(cur, sw.Value, StringComparison.Ordinal)) { swapped.Remove(id); had = false; } // game changed it since
-                if (zh)
-                {
-                    if (had) continue;
-                    var key = cur.Trim();
-                    string z;
-                    if ((key.IndexOf(' ') > 0 && Plugin.Names.TryGetValue(key, out z)) || Plugin.Hardcoded.TryGetValue(key, out z))
-                    {
-                        swapped[id] = new KeyValuePair<string, string>(cur, z);
-                        t.text = z;
-                    }
-                }
-                else if (had)
-                {
-                    t.text = sw.Key;
-                    swapped.Remove(id);
-                }
+                if (__instance == null) return;
+                FontManager.AttachTo(__instance.font);
+                Check(__instance);
+            }
+            catch { }
+        }
+
+        static void SetPrefix(TMP_Text __instance, ref string value) { Swap(__instance, ref value); }
+        static void SetTextPrefix(TMP_Text __instance, ref string sourceText) { Swap(__instance, ref sourceText); }
+
+        static void Swap(TMP_Text t, ref string value)
+        {
+            try
+            {
+                if (swapped.Count > 0) swapped.Remove(t);   // the game is writing new text
+                if (!Plugin.ZhActive) return;
+                string z;
+                if (Lookup(value, out z)) { var orig = value; value = z; swapped[t] = new KeyValuePair<string, string>(orig, z); }
+            }
+            catch { }
+        }
+
+        static void Check(TMP_Text t)
+        {
+            if (!Plugin.ZhActive || swapped.ContainsKey(t)) return;
+            var cur = t.text;
+            string z;
+            if (Lookup(cur, out z))
+            {
+                t.text = z;   // goes through SetPrefix: Lookup(z) misses, nothing recorded
+                swapped[t] = new KeyValuePair<string, string>(cur, z);
+            }
+        }
+
+        // Full pass: only on scene load and language change.
+        public static void ScanAll()
+        {
+            foreach (var k in swapped.Keys.Where(k => k == null).ToList()) swapped.Remove(k);
+            if (Plugin.ZhActive)
+            {
+                foreach (var t in Resources.FindObjectsOfTypeAll<TMP_Text>())
+                    if (t != null) Check(t);
+            }
+            else if (swapped.Count > 0)
+            {
+                var list = swapped.ToList();
+                swapped.Clear();
+                foreach (var kv in list)
+                    if (kv.Key != null && string.Equals(kv.Key.text, kv.Value.Value, StringComparison.Ordinal)) kv.Key.text = kv.Value.Key;
             }
         }
     }
@@ -473,6 +586,25 @@ namespace TdfZhCN
         {
             var m = AccessTools.Method(typeof(DialogueManager), "SetLanguage", new[] { typeof(string) });
             h.Patch(m, prefix: new HarmonyMethod(typeof(DialoguePatcher), nameof(SetLanguagePrefix)));
+            var add = AccessTools.Method(typeof(DialogueManager), "AddDatabase", new[] { typeof(DialogueDatabase) });
+            if (add != null) h.Patch(add, postfix: new HarmonyMethod(typeof(DialoguePatcher), nameof(AddDatabasePostfix)));
+        }
+
+        internal static bool Ready => done.Count > 0;   // the main database has been found and patched once
+        static void AddDatabasePostfix() { Plugin.DialogueScanPending = true; }
+
+        // cheap safety net: if the runtime master database gained conversations, scan once
+        static int lastMasterCount = -1;
+        internal static void CheckMaster()
+        {
+            try
+            {
+                if (!DialogueManager.hasInstance) return;
+                var db = DialogueManager.masterDatabase;
+                int c = (db != null && db.conversations != null) ? db.conversations.Count : -1;
+                if (c != lastMasterCount) { lastMasterCount = c; Plugin.DialogueScanPending = true; }
+            }
+            catch { }
         }
 
         static void SetLanguagePrefix() { try { Scan(); } catch (Exception e) { Plugin.Log.LogError("[TDF-zh] " + e); } }
@@ -527,8 +659,10 @@ namespace TdfZhCN
         internal static string FontPath;
         internal static TMP_FontAsset Cjk;
         internal static bool Failed;
-        static int lastFontCount = -1;
         static bool warnedShader;
+        internal static bool Frozen;   // all glyphs rendered, atlas made static and non-readable
+        static int prewarmPos, prewarmMissing;
+        static List<TMP_FontAsset> updateQueue;
 
         static readonly MethodInfo Original = AccessTools.Method(typeof(FontEngine), "LoadFontFace", new[] { typeof(Font), typeof(int) });
         static readonly MethodInfo Replacement = AccessTools.Method(typeof(FontManager), nameof(LoadFontFace));
@@ -615,6 +749,24 @@ namespace TdfZhCN
 
             }
 
+            bool changed = EnsureGlobal();
+            Protect();
+
+            // attach as fallback to every font asset the game has loaded (on scene loads only; fonts loaded
+            // mid-scene are caught by the OnEnable / font-setter hooks)
+            var all = Resources.FindObjectsOfTypeAll<TMP_FontAsset>();
+            HashSet<TMP_FontAsset> fresh = null;
+            foreach (var fa in all)
+                if (AttachTo(fa)) (fresh ?? (fresh = new HashSet<TMP_FontAsset>())).Add(fa);
+            if (fresh != null) Plugin.Log.LogInfo($"[TDF-zh] CJK fallback attached to {fresh.Count} font assets (total {all.Length})");
+            if (changed) RefreshTexts(null);          // first time only: everything
+            else if (fresh != null) RefreshTexts(fresh); // otherwise only texts using a newly seen font
+        }
+
+        // cheap: make sure the CJK font is in TMP's global fallback list. Returns true if it had to be added.
+        internal static bool EnsureGlobal()
+        {
+            if (Cjk == null) return false;
             bool changed = false;
             var global = TMP_Settings.fallbackFontAssets;
             if (global == null)
@@ -623,34 +775,66 @@ namespace TdfZhCN
                 AccessTools.Field(typeof(TMP_Settings), "m_fallbackFontAssets").SetValue(TMP_Settings.instance, global);
             }
             if (!global.Contains(Cjk)) { global.Add(Cjk); changed = true; }
-            Protect();
+            return changed;
+        }
 
-            // attach as fallback to every font asset the game has loaded (re-checked every time:
-            // font assets can be unloaded and reloaded with a fresh fallback list)
-            var all = Resources.FindObjectsOfTypeAll<TMP_FontAsset>();
-            int added = 0;
-            foreach (var fa in all)
-            {
-                if (fa == null || fa == Cjk) continue;
-                var list = fa.fallbackFontAssetTable;
-                if (list == null) { list = new List<TMP_FontAsset>(); fa.fallbackFontAssetTable = list; }
-                if (!list.Contains(Cjk)) { list.Add(Cjk); added++; }
-            }
-            if (added > 0) { changed = true; Plugin.Log.LogInfo($"[TDF-zh] CJK fallback attached to {added} font assets (total {all.Length})"); }
-            if (all.Length != lastFontCount) { lastFontCount = all.Length; changed = true; }
-            if (changed) RefreshTexts();
+        // returns true if the fallback had to be added
+        internal static bool AttachTo(TMP_FontAsset fa)
+        {
+            if (Cjk == null || fa == null || fa == Cjk) return false;
+            var list = fa.fallbackFontAssetTable;
+            if (list == null) { list = new List<TMP_FontAsset>(); fa.fallbackFontAssetTable = list; }
+            if (list.Contains(Cjk)) return false;
+            list.Add(Cjk);
+            return true;
         }
 
         // texts that were laid out before the fallback existed keep their boxes until re-parsed
-        static void RefreshTexts()
+        static void RefreshTexts(HashSet<TMP_FontAsset> only)
         {
             int n = 0;
             foreach (var t in Resources.FindObjectsOfTypeAll<TMP_Text>())
             {
                 if (t == null) continue;
+                if (only != null && !only.Contains(t.font)) continue;
                 try { t.havePropertiesChanged = true; if (t.isActiveAndEnabled) t.ForceMeshUpdate(false, true); n++; } catch { }
             }
             Plugin.Log.LogInfo($"[TDF-zh] refreshed {n} text objects");
+        }
+
+        // Render every CJK character the translation uses into the atlas up front, a batch per frame,
+        // so no glyph has to be rasterized (and the 4096² atlas re-uploaded) in the middle of play.
+        // Then freeze the atlas: static mode (TMP stops trying to add glyphs at runtime) and
+        // non-readable (frees the 16 MB CPU-side copy of the texture; the GPU copy stays).
+        internal static void PrewarmStep()
+        {
+            if (Frozen || Cjk == null || Failed) return;
+            var all = Plugin.PrewarmChars;
+            if (prewarmPos == 0) Plugin.Log.LogInfo($"[TDF-zh] pre-rendering {all.Length} CJK glyphs");
+            if (prewarmPos < all.Length)
+            {
+                int len = Math.Min(128, all.Length - prewarmPos);
+                string missing;
+                Cjk.TryAddCharacters(all.Substring(prewarmPos, len), out missing, false);
+                if (!string.IsNullOrEmpty(missing)) prewarmMissing += missing.Length;
+                prewarmPos += len;
+                return;
+            }
+            // wait until TMP has no pending upload for our atlas, then freeze (next frame at the earliest)
+            if (updateQueue == null)
+                updateQueue = AccessTools.Field(typeof(TMP_FontAsset), "k_FontAssets_AtlasTexturesUpdateQueue")?.GetValue(null) as List<TMP_FontAsset> ?? new List<TMP_FontAsset>();
+            if (updateQueue.Contains(Cjk)) return;
+            Frozen = true;
+            Cjk.atlasPopulationMode = AtlasPopulationMode.Static;
+            int texN = 0;
+            foreach (var t in Cjk.atlasTextures)
+            {
+                if (t == null || !t.isReadable) continue;
+                t.Apply(false, true);
+                texN++;
+            }
+            Protect();
+            Plugin.Log.LogInfo($"[TDF-zh] glyph pre-render done: {Cjk.characterTable.Count} characters ({prewarmMissing} not in font), {Cjk.atlasTextures.Length} atlas texture(s); atlas frozen ({texN} made non-readable)");
         }
 
         static void Protect()

@@ -1,4 +1,4 @@
-《The Darkest Files》（至暗卷宗）非官方简体中文补丁  v1.0.5
+《The Darkest Files》（至暗卷宗）非官方简体中文补丁  v1.0.7
 ================================================================
 适用：Steam 版 The Darkest Files，游戏版本 1.0.8.2
 平台：Windows / Steam Deck（不适用于 Mac 版）
